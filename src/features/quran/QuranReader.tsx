@@ -1,8 +1,11 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Modal, ScrollView, SafeAreaView } from 'react-native';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Modal, ScrollView, Dimensions, SafeAreaView } from 'react-native';
 import { ChevronDown, X, BookOpen } from 'lucide-react-native';
-import { useChapters, useVerses, useTafsir, Chapter, Verse } from '../../hooks/useQuran';
+import { useQueryClient } from '@tanstack/react-query';
+import { useChapters, useVerses, useTafsir, fetchVersesByChapter, Chapter, Verse } from '../../hooks/useQuran';
 import { theme } from '../../shared/theme';
+
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 const TAFSIRS = [
   { id: 16, name: 'التفسير الميسر' },
@@ -78,13 +81,87 @@ interface QuranReaderProps {
   initialChapter?: number;
 }
 
+const ChapterPage = ({ chapter, onVersePress }: { chapter: Chapter, onVersePress: (v: Verse) => void }) => {
+  const { data: verses, isLoading } = useVerses(chapter.id);
+
+  if (isLoading) {
+    return (
+      <View style={[styles.centered, { width: SCREEN_WIDTH }]}>
+        <ActivityIndicator size="large" color={theme.colors.primary} />
+      </View>
+    );
+  }
+
+  return (
+    <ScrollView contentContainerStyle={styles.versesContainer} showsVerticalScrollIndicator={false} style={{ width: SCREEN_WIDTH }}>
+      {chapter.bismillah_pre && (
+        <Text style={styles.bismillah}>بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ</Text>
+      )}
+      <Text style={styles.mushafTextContainer}>
+        {verses?.map((item) => (
+          <Text 
+            key={item.id} 
+            style={styles.verseText} 
+            onPress={() => onVersePress(item)}
+            suppressHighlighting
+          >
+            {item.text_uthmani.replace(/(\r\n|\n|\r)/gm, "").trim()} <Text style={styles.ayahNumber}>﴿{toArabicNumerals(item.verse_key.split(':')[1])}﴾</Text>{' '}
+          </Text>
+        ))}
+      </Text>
+    </ScrollView>
+  );
+};
+
 export const QuranReader: React.FC<QuranReaderProps> = ({ initialChapter = 1 }) => {
   const [selectedChapterId, setSelectedChapterId] = useState<number>(initialChapter);
   const [isChapterListVisible, setIsChapterListVisible] = useState(false);
   const [selectedVerse, setSelectedVerse] = useState<Verse | null>(null);
 
+  const flatListRef = useRef<FlatList>(null);
+  const queryClient = useQueryClient();
   const { data: chapters, isLoading: isLoadingChapters } = useChapters();
-  const { data: verses, isLoading: isLoadingVerses } = useVerses(selectedChapterId);
+
+  // Prefetch Adjacent Surahs (Pages) for seamless swiping
+  useEffect(() => {
+    if (selectedChapterId < 114) {
+      queryClient.prefetchQuery({
+        queryKey: ['verses', selectedChapterId + 1],
+        queryFn: () => fetchVersesByChapter(selectedChapterId + 1),
+        staleTime: Infinity,
+      });
+    }
+    if (selectedChapterId > 1) {
+      queryClient.prefetchQuery({
+        queryKey: ['verses', selectedChapterId - 1],
+        queryFn: () => fetchVersesByChapter(selectedChapterId - 1),
+        staleTime: Infinity,
+      });
+    }
+  }, [selectedChapterId, queryClient]);
+
+  // Keep dropdown and header synced to current physical page
+  const onViewableItemsChanged = useCallback(({ viewableItems }: any) => {
+    if (viewableItems.length > 0) {
+      const activeChapterId = viewableItems[0].item.id;
+      if (activeChapterId !== selectedChapterId) {
+        setSelectedChapterId(activeChapterId);
+      }
+    }
+  }, [selectedChapterId]);
+
+  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 50 }).current;
+
+  const scrollToChapter = (chapterId: number) => {
+    setSelectedChapterId(chapterId);
+    setIsChapterListVisible(false);
+    if (flatListRef.current && chapters) {
+      const index = chapters.findIndex(c => c.id === chapterId);
+      if (index !== -1) {
+        flatListRef.current.scrollToIndex({ index, animated: false });
+      }
+    }
+  };
 
   const selectedChapter = chapters?.find(c => c.id === selectedChapterId);
 
@@ -119,10 +196,7 @@ export const QuranReader: React.FC<QuranReaderProps> = ({ initialChapter = 1 }) 
               renderItem={({ item }) => (
                 <TouchableOpacity 
                   style={[styles.chapterItem, selectedChapterId === item.id && styles.activeChapterItem]}
-                  onPress={() => {
-                    setSelectedChapterId(item.id);
-                    setIsChapterListVisible(false);
-                  }}
+                  onPress={() => scrollToChapter(item.id)}
                 >
                   <View style={styles.chapterItemLeft}>
                     <View style={styles.chapterNumberBadge}>
@@ -140,30 +214,32 @@ export const QuranReader: React.FC<QuranReaderProps> = ({ initialChapter = 1 }) 
         </View>
       </Modal>
 
-      {/* Verses List */}
+      {/* Verses List / Pages */}
       <View style={styles.mushafContainer}>
-        {isLoadingVerses ? (
+        {isLoadingChapters ? (
           <View style={styles.centered}>
             <ActivityIndicator size="large" color={theme.colors.primary} />
           </View>
         ) : (
-          <ScrollView contentContainerStyle={styles.versesContainer} showsVerticalScrollIndicator={false}>
-            {selectedChapter?.bismillah_pre && (
-              <Text style={styles.bismillah}>بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ</Text>
+          <FlatList
+            ref={flatListRef}
+            data={chapters}
+            keyExtractor={item => item.id.toString()}
+            horizontal
+            pagingEnabled
+            showsHorizontalScrollIndicator={false}
+            initialScrollIndex={initialChapter - 1}
+            getItemLayout={(data, index) => ({ length: SCREEN_WIDTH, offset: SCREEN_WIDTH * index, index })}
+            onViewableItemsChanged={onViewableItemsChanged}
+            viewabilityConfig={viewabilityConfig}
+            initialNumToRender={1}
+            windowSize={5}
+            maxToRenderPerBatch={3}
+            removeClippedSubviews={false} // Helps keep prefetched content stable across swipes
+            renderItem={({ item }) => (
+              <ChapterPage chapter={item} onVersePress={setSelectedVerse} />
             )}
-            <Text style={styles.mushafTextContainer}>
-              {verses?.map((item) => (
-                <Text 
-                  key={item.id} 
-                  style={styles.verseText} 
-                  onPress={() => setSelectedVerse(item)}
-                  suppressHighlighting
-                >
-                  {item.text_uthmani} <Text style={styles.ayahNumber}>﴿{toArabicNumerals(item.verse_key.split(':')[1])}﴾</Text>{' '}
-                </Text>
-              ))}
-            </Text>
-          </ScrollView>
+          />
         )}
       </View>
 
